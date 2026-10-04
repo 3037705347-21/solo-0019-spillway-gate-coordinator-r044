@@ -46,14 +46,22 @@ func (s *Service) Command(ctx context.Context, id string) (domain.GateCommand, e
 	return s.repository.Command(ctx, id)
 }
 
+// BackwaterOutcome is the coordination-level result of a backwater report.
+type BackwaterOutcome struct {
+	State     string
+	CommandID string
+	Command   domain.GateCommand
+	Gate      domain.Gate
+}
+
 func (s *Service) ReportBackwater(
 	ctx context.Context,
 	gateID string,
 	request contracts.ReportBackwaterRequest,
-) (string, domain.GateCommand, domain.Gate, error) {
+) (BackwaterOutcome, error) {
 	reportID := strings.TrimSpace(request.ReportID)
 	if reportID == "" {
-		return "", domain.GateCommand{}, domain.Gate{}, domain.Invalid(
+		return BackwaterOutcome{}, domain.Invalid(
 			"invalid_backwater_report",
 			"report id is required",
 		)
@@ -65,26 +73,25 @@ func (s *Service) ReportBackwater(
 		Exceeded:         request.Level > request.Limit,
 		FallbackAperture: request.FallbackAperture,
 	}
-	if action.Exceeded {
-		commandID, err := s.newID("bw")
-		if err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, domain.Internal(
-				"backwater_command_id_generation_failed",
-				"automatic fallback command id could not be generated",
-			)
-		}
-		token, err := s.newToken()
-		if err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, domain.Internal(
-				"backwater_token_generation_failed",
-				"automatic fallback token could not be generated",
-			)
-		}
-		action.CommandID = commandID
-		action.Token = token
-	}
 
-	return s.repository.ReportBackwater(ctx, action, s.now())
+	result, err := s.repository.ReportBackwater(
+		ctx,
+		action,
+		s.now(),
+		func() (string, error) {
+			return s.newID("bw")
+		},
+		s.newToken,
+	)
+	if err != nil {
+		return BackwaterOutcome{}, err
+	}
+	return BackwaterOutcome{
+		State:     result.State,
+		CommandID: result.CommandID,
+		Command:   result.Command,
+		Gate:      result.Gate,
+	}, nil
 }
 
 func (s *Service) ReviewInterlock(

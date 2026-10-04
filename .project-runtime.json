@@ -26,6 +26,10 @@
     {
       "workflow_id": "execute-gate-command",
       "command": "go run ./cmd/workflowcheck --workflow execute-gate-command"
+    },
+    {
+      "workflow_id": "backwater-interlock",
+      "command": "go run ./cmd/workflowcheck --workflow backwater-interlock"
     }
   ]
 }

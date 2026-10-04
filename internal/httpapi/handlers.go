@@ -117,7 +117,7 @@ func (h *handler) reportBackwater(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, command, gate, err := h.service.ReportBackwater(
+	outcome, err := h.service.ReportBackwater(
 		r.Context(),
 		r.PathValue("id"),
 		request,
@@ -128,12 +128,12 @@ func (h *handler) reportBackwater(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := contracts.BackwaterResponse{
-		State: state,
-		Gate:  gateView(gate),
+		State:     outcome.State,
+		CommandID: outcome.CommandID,
+		Gate:      gateView(outcome.Gate),
 	}
-	if command.ID != "" {
-		commandViewValue := commandView(command, false)
-		response.CommandID = command.ID
+	if outcome.Command.ID != "" {
+		commandViewValue := commandView(outcome.Command, false)
 		response.Command = &commandViewValue
 	}
 	writeJSON(w, http.StatusOK, response)

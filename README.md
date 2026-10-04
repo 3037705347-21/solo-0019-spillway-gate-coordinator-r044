@@ -20,6 +20,7 @@ POST /commands
 GET  /commands/{id}
 POST /commands/{id}/interlock
 POST /commands/{id}/execute
+POST /gates/{id}/backwater
 ```
 
 登记闸门示例：
@@ -64,6 +65,27 @@ POST /commands/{id}/execute
 }
 ```
 
+## 下游水位联动
+
+`POST /gates/{id}/backwater` 接收一轮下游水位上报：
+
+```json
+{
+  "report_id": "incident-2026-10-04-01",
+  "level": 4.2,
+  "limit": 3.0,
+  "fallback_aperture": 0.5
+}
+```
+
+联动规则：
+
+- 一轮越限由 `(闸门, report_id)` 唯一标识，重复上报返回同一轮结果，不会生成第二份回退动作或命令。
+- 闸门空闲时，自动回退作为一条带联锁结论和执行令牌的普通命令完成（`completed`），闸门经过 reserved/moving 后回到 idle。
+- 闸门已被人工命令占用（reserved/moving/faulted）时，回退以稳定的命令身份进入 `queued`，绝不覆写在途人工命令；人工动作正常结束回到 idle 后排队回退才接续执行。
+- 同一轮随后收到未越限上报：排队中的回退转为 `canceled`（令牌失效、永不物化）；已完成的轮次保持 `completed` 不变。
+- faulted 闸门不参与自动恢复，排队回退保持 `queued` 直至显式解除。
+
 ## 目录
 
 - `cmd/server`：服务进程。
@@ -82,6 +104,7 @@ go run ./cmd/workflowcheck --workflow register-gate
 go run ./cmd/workflowcheck --workflow request-gate-command
 go run ./cmd/workflowcheck --workflow review-safety-interlock
 go run ./cmd/workflowcheck --workflow execute-gate-command
+go run ./cmd/workflowcheck --workflow backwater-interlock
 ```
 
 这些检查会创建临时 HTTP 服务并调用真实路由。它们不调用外部网络，也不依赖数据库。

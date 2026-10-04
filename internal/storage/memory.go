@@ -14,7 +14,7 @@ type MemoryRepository struct {
 	gates           map[string]domain.Gate
 	commands        map[string]domain.GateCommand
 	backwater       map[string]backwaterRecord
-	backwaterByGate map[string]string
+	queuedBackwater map[string][]string
 }
 
 type backwaterRecord struct {
@@ -26,11 +26,15 @@ type backwaterRecord struct {
 	FallbackAperture float64
 }
 
+// Backwater round states. A round is the lifecycle of one report id on one
+// gate: it is either completed immediately, queued behind the gate's active
+// manual command, canceled by a clearing report, or recorded as clear when no
+// fallback was ever required.
 const (
-	backwaterQueued    = "queued"
-	backwaterCompleted = "completed"
-	backwaterCanceled  = "canceled"
-	backwaterClear     = "clear"
+	BackwaterQueued    = "queued"
+	BackwaterCompleted = "completed"
+	BackwaterCanceled  = "canceled"
+	BackwaterClear     = "clear"
 )
 
 func NewMemoryRepository() *MemoryRepository {
@@ -38,7 +42,7 @@ func NewMemoryRepository() *MemoryRepository {
 		gates:           make(map[string]domain.Gate),
 		commands:        make(map[string]domain.GateCommand),
 		backwater:       make(map[string]backwaterRecord),
-		backwaterByGate: make(map[string]string),
+		queuedBackwater: make(map[string][]string),
 	}
 }
 
@@ -108,50 +112,136 @@ func (m *MemoryRepository) ReportBackwater(
 	_ context.Context,
 	action BackwaterAction,
 	now time.Time,
-) (string, domain.GateCommand, domain.Gate, error) {
+	newCommandID func() (string, error),
+	newToken func() (string, error),
+) (BackwaterResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	gate, exists := m.gates[action.GateID]
 	if !exists {
-		return "", domain.GateCommand{}, domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
+		return BackwaterResult{}, domain.NotFound("gate_not_found", "gate id was not found")
 	}
 	reportID := strings.TrimSpace(action.ReportID)
 	if reportID == "" {
-		return "", domain.GateCommand{}, domain.Gate{}, domain.Invalid("invalid_backwater_report", "report id is required")
+		return BackwaterResult{}, domain.Invalid("invalid_backwater_report", "report id is required")
+	}
+	if action.FallbackAperture < 0 || action.FallbackAperture > gate.MaxAperture {
+		return BackwaterResult{}, domain.Invalid(
+			"invalid_fallback_aperture",
+			"fallback aperture must be within the gate limit",
+		)
 	}
 
 	key := backwaterKey(action.GateID, reportID)
-	record, exists := m.backwater[key]
-	if exists && record.State == backwaterQueued {
-		command := domain.GateCommand{}
-		if record.CommandID != "" {
-			command = cloneCommand(m.commands[record.CommandID])
+
+	// A replay of the same report is the same round: return its recorded
+	// outcome instead of creating a second fallback command.
+	if record, exists := m.backwater[key]; exists {
+		// A later, non-exceeded delivery for the same round releases a
+		// fallback that has not started moving yet.
+		if !action.Exceeded && record.State == BackwaterQueued {
+			record = m.cancelQueuedBackwaterLocked(record)
 		}
-		return record.State, command, gate, nil
+		return m.backwaterResultLocked(record), nil
 	}
 
+	// First delivery for this round. A non-exceeded report requires no
+	// fallback at all; the round is recorded as clear and is idempotent.
 	if !action.Exceeded {
-		if !exists {
-			record = backwaterRecord{
-				GateID:   action.GateID,
-				ReportID: reportID,
-			}
+		record := backwaterRecord{
+			GateID:           action.GateID,
+			ReportID:         reportID,
+			State:            BackwaterClear,
+			FallbackAperture: action.FallbackAperture,
 		}
-		if record.State == backwaterQueued {
-			return backwaterCanceled, domain.GateCommand{}, gate, nil
-		}
-		record.State = backwaterClear
-		record.FallbackAperture = action.FallbackAperture
 		m.backwater[key] = record
-		m.backwaterByGate[action.GateID] = key
-		return backwaterClear, domain.GateCommand{}, gate, nil
+		return m.backwaterResultLocked(record), nil
 	}
 
+	// Exceeded round: the fallback identity is generated once and survives
+	// even while the movement waits behind the gate's active command.
+	commandID, err := newCommandID()
+	if err != nil {
+		return BackwaterResult{}, domain.Internal(
+			"backwater_command_id_generation_failed",
+			"automatic fallback command id could not be generated",
+		)
+	}
+	commandID = strings.TrimSpace(commandID)
+	if commandID == "" {
+		return BackwaterResult{}, domain.Internal(
+			"backwater_command_id_generation_failed",
+			"automatic fallback command id could not be generated",
+		)
+	}
+	token, err := newToken()
+	if err != nil {
+		return BackwaterResult{}, domain.Internal(
+			"backwater_token_generation_failed",
+			"automatic fallback token could not be generated",
+		)
+	}
+
+	record := backwaterRecord{
+		GateID:           action.GateID,
+		ReportID:         reportID,
+		CommandID:        commandID,
+		Token:            token,
+		FallbackAperture: action.FallbackAperture,
+	}
+
+	// The gate is occupied by an active manual command. The fallback must
+	// not touch the gate or the operator's command: it waits until the gate
+	// settles. A faulted gate is excluded from automatic recovery as well.
+	if gate.Status != domain.GateIdle {
+		record.State = BackwaterQueued
+		m.backwater[key] = record
+		m.queuedBackwater[action.GateID] = append(m.queuedBackwater[action.GateID], key)
+		return m.backwaterResultLocked(record), nil
+	}
+
+	// Gate is free: the automatic fallback runs to completion immediately.
+	// If the aperture is already at the fallback value there is nothing to
+	// move, but the round is still recorded with one stable identity.
+	nextGate := gate
+	if gate.Aperture != action.FallbackAperture {
+		var command domain.GateCommand
+		nextGate, command, err = m.buildFallbackMovementLocked(gate, record, now)
+		if err != nil {
+			return BackwaterResult{}, err
+		}
+		record.State = BackwaterCompleted
+		m.commands[command.ID] = command
+		m.gates[action.GateID] = nextGate
+		m.backwater[key] = record
+		return BackwaterResult{
+			State:     BackwaterCompleted,
+			CommandID: command.ID,
+			Command:   cloneCommand(command),
+			Gate:      cloneGate(nextGate),
+		}, nil
+	}
+
+	record.State = BackwaterCompleted
+	m.backwater[key] = record
+	return m.backwaterResultLocked(record), nil
+}
+
+// buildFallbackMovementLocked builds one automatic fallback as a normal
+// command lifecycle (approved -> executing -> completed) while the gate
+// follows idle -> reserved -> moving -> idle. It mutates only the passed
+// values; the caller commits the returned command and gate together with the
+// round state while still holding m.mu.
+func (m *MemoryRepository) buildFallbackMovementLocked(
+	gate domain.Gate,
+	record backwaterRecord,
+	now time.Time,
+) (domain.Gate, domain.GateCommand, error) {
 	command, err := domain.NewGateCommand(
-		action.CommandID,
-		action.GateID,
-		action.FallbackAperture,
+		record.CommandID,
+		gate.ID,
+		record.FallbackAperture,
 		gate.Aperture,
 		gate.MaxAperture,
 		"downstream_backwater_fallback",
@@ -159,7 +249,7 @@ func (m *MemoryRepository) ReportBackwater(
 		now,
 	)
 	if err != nil {
-		return "", domain.GateCommand{}, domain.Gate{}, err
+		return domain.Gate{}, domain.GateCommand{}, err
 	}
 	decision, err := domain.NewInterlockDecision(
 		"clear",
@@ -168,55 +258,70 @@ func (m *MemoryRepository) ReportBackwater(
 		now,
 	)
 	if err != nil {
-		return "", domain.GateCommand{}, domain.Gate{}, err
+		return domain.Gate{}, domain.GateCommand{}, err
 	}
-	if err := command.Review(decision, action.Token, now); err != nil {
-		return "", domain.GateCommand{}, domain.Gate{}, err
+	if err := command.Review(decision, record.Token, now); err != nil {
+		return domain.Gate{}, domain.GateCommand{}, err
+	}
+	if err := command.BeginExecution(record.Token, "backwater-controller", now); err != nil {
+		return domain.Gate{}, domain.GateCommand{}, err
 	}
 
 	nextGate := gate
-	if gate.Status == domain.GateIdle {
-		if err := command.BeginExecution(action.Token, "backwater-controller", now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		if err := nextGate.Reserve(command.ID, now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		if err := nextGate.StartMovement(command.ID, now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		if err := nextGate.Settle(command.TargetAperture, false, now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		if err := command.Complete(now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-	} else {
-		if err := command.BeginExecution(action.Token, "backwater-controller", now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		nextGate.ActiveCommandID = command.ID
-		nextGate.Status = domain.GateMoving
-		nextGate.Aperture = command.TargetAperture
-		nextGate.UpdatedAt = now.UTC()
-		nextGate.Version++
-		if err := command.Complete(now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
+	if err := nextGate.Reserve(command.ID, now); err != nil {
+		return domain.Gate{}, domain.GateCommand{}, err
+	}
+	if err := nextGate.StartMovement(command.ID, now); err != nil {
+		return domain.Gate{}, domain.GateCommand{}, err
+	}
+	if err := nextGate.Settle(command.TargetAperture, false, now); err != nil {
+		return domain.Gate{}, domain.GateCommand{}, err
+	}
+	if err := command.Complete(now); err != nil {
+		return domain.Gate{}, domain.GateCommand{}, err
 	}
 
-	m.commands[command.ID] = command
-	m.gates[action.GateID] = nextGate
-	record = backwaterRecord{
-		GateID:           action.GateID,
-		ReportID:         reportID,
-		State:            backwaterCompleted,
-		CommandID:        command.ID,
-		FallbackAperture: action.FallbackAperture,
+	return nextGate, command, nil
+}
+
+// backwaterResultLocked projects a stored round. Only completed rounds expose
+// the materialized command; queued and canceled rounds expose the stable
+// command identity alone so later reviews and handovers can correlate them.
+func (m *MemoryRepository) backwaterResultLocked(record backwaterRecord) BackwaterResult {
+	gate := m.gates[record.GateID]
+	result := BackwaterResult{
+		State:     record.State,
+		CommandID: record.CommandID,
+		Gate:      cloneGate(gate),
 	}
-	m.backwater[key] = record
-	m.backwaterByGate[action.GateID] = key
-	return backwaterCompleted, cloneCommand(command), nextGate, nil
+	if record.State == BackwaterCompleted && record.CommandID != "" {
+		if command, exists := m.commands[record.CommandID]; exists {
+			result.Command = cloneCommand(command)
+		}
+	}
+	return result
+}
+
+// cancelQueuedBackwaterLocked releases a fallback that is still waiting behind
+// the active manual command. The queued command has not touched the gate, so
+// revoking its token and marking the round canceled leaves the manual
+// workflow untouched.
+func (m *MemoryRepository) cancelQueuedBackwaterLocked(record backwaterRecord) backwaterRecord {
+	queue := m.queuedBackwater[record.GateID]
+	kept := queue[:0]
+	for _, key := range queue {
+		if key != backwaterKey(record.GateID, record.ReportID) {
+			kept = append(kept, key)
+		}
+	}
+	if len(kept) == 0 {
+		delete(m.queuedBackwater, record.GateID)
+	} else {
+		m.queuedBackwater[record.GateID] = kept
+	}
+	record.State = BackwaterCanceled
+	m.backwater[backwaterKey(record.GateID, record.ReportID)] = record
+	return record
 }
 
 func (m *MemoryRepository) ReviewCommand(
@@ -301,75 +406,92 @@ func (m *MemoryRepository) ExecuteCommand(
 		}
 	}
 
+	// Commit the manual outcome and any queued fallback activations as one
+	// unit: activateBackwaterLocked only mutates repository state once every
+	// queued movement succeeds, so a failure leaves no partial result behind.
+	activatedGate, err := m.activateBackwaterLocked(nextGate, now)
+	if err != nil {
+		return domain.GateCommand{}, domain.Gate{}, err
+	}
 	m.commands[nextCommand.ID] = nextCommand
-	m.gates[nextGate.ID] = nextGate
-	nextGate = m.activateBackwaterLocked(nextGate, now)
-	m.gates[nextGate.ID] = nextGate
-	return cloneCommand(nextCommand), nextGate, nil
+	m.gates[activatedGate.ID] = activatedGate
+	return cloneCommand(nextCommand), cloneGate(activatedGate), nil
 }
 
-func (m *MemoryRepository) activateBackwaterLocked(gate domain.Gate, now time.Time) domain.Gate {
+// activateBackwaterLocked drains the queued fallback rounds for a gate that
+// has just settled back to idle. Each round becomes a normal, fully traceable
+// fallback command; the gate ends idle and unreserved so the next queued
+// round can follow. Faulted gates are never recovered automatically. Map
+// mutations happen only after every queued movement has succeeded, which
+// keeps the manual execution and the fallback activation atomic.
+func (m *MemoryRepository) activateBackwaterLocked(gate domain.Gate, now time.Time) (domain.Gate, error) {
 	if gate.Status != domain.GateIdle {
-		return gate
-	}
-	key, exists := m.backwaterByGate[gate.ID]
-	if !exists {
-		return gate
-	}
-	record := m.backwater[key]
-	if record.State != backwaterQueued || record.CommandID == "" {
-		return gate
+		return gate, nil
 	}
 
-	command, err := domain.NewGateCommand(
-		record.CommandID,
-		gate.ID,
-		record.FallbackAperture,
-		gate.Aperture,
-		gate.MaxAperture,
-		"downstream_backwater_fallback",
-		"backwater-controller",
-		now,
-	)
-	if err != nil {
-		return gate
-	}
-	decision, err := domain.NewInterlockDecision(
-		"clear",
-		"backwater-controller",
-		"automatic downstream fallback",
-		now,
-	)
-	if err != nil {
-		return gate
-	}
-	if err := command.Review(decision, record.Token, now); err != nil {
-		return gate
+	keys := append([]string(nil), m.queuedBackwater[gate.ID]...)
+	current := gate
+	completed := make(map[string]backwaterRecord)
+	dequeued := make(map[string]struct{})
+	newCommands := make(map[string]domain.GateCommand)
+
+	for _, key := range keys {
+		record, exists := m.backwater[key]
+		if !exists || record.State != BackwaterQueued || record.CommandID == "" {
+			dequeued[key] = struct{}{}
+			continue
+		}
+
+		// A round may have already reached the fallback aperture (an
+		// earlier queued round moved to the same value): close it without
+		// creating another movement.
+		if current.Aperture == record.FallbackAperture {
+			record.State = BackwaterCompleted
+			completed[key] = record
+			dequeued[key] = struct{}{}
+			continue
+		}
+
+		next, command, err := m.buildFallbackMovementLocked(current, record, now)
+		if err != nil {
+			return domain.Gate{}, err
+		}
+		current = next
+		newCommands[command.ID] = command
+		record.State = BackwaterCompleted
+		completed[key] = record
+		dequeued[key] = struct{}{}
 	}
 
-	nextGate := gate
-	if err := command.BeginExecution(record.Token, "backwater-controller", now); err != nil {
-		return gate
+	for id, command := range newCommands {
+		m.commands[id] = command
 	}
-	if err := nextGate.Reserve(command.ID, now); err != nil {
-		return gate
+	for key, record := range completed {
+		m.backwater[key] = record
 	}
-	if err := nextGate.StartMovement(command.ID, now); err != nil {
-		return gate
+	for key := range dequeued {
+		m.dequeueBackwaterLocked(gate.ID, key)
 	}
-	if err := nextGate.Settle(command.TargetAperture, false, now); err != nil {
-		return gate
-	}
-	if err := command.Complete(now); err != nil {
-		return gate
-	}
+	return current, nil
+}
 
-	m.commands[command.ID] = command
-	record.State = backwaterCompleted
-	record.CommandID = command.ID
-	m.backwater[key] = record
-	m.gates[gate.ID] = nextGate
-	return nextGate
+func (m *MemoryRepository) dequeueBackwaterLocked(gateID, key string) {
+	queue := m.queuedBackwater[gateID]
+	kept := queue[:0]
+	for _, queuedKey := range queue {
+		if queuedKey != key {
+			kept = append(kept, queuedKey)
+		}
+	}
+	if len(kept) == 0 {
+		delete(m.queuedBackwater, gateID)
+	} else {
+		m.queuedBackwater[gateID] = kept
+	}
+}
+
+func cloneGate(gate domain.Gate) domain.Gate {
+	return gate
 }
 
 func cloneCommand(command domain.GateCommand) domain.GateCommand {

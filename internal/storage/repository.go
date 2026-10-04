@@ -16,7 +16,9 @@ type Repository interface {
 		ctx context.Context,
 		action BackwaterAction,
 		now time.Time,
-	) (string, domain.GateCommand, domain.Gate, error)
+		newCommandID func() (string, error),
+		newToken func() (string, error),
+	) (BackwaterResult, error)
 	ReviewCommand(
 		ctx context.Context,
 		commandID string,
@@ -39,6 +41,14 @@ type BackwaterAction struct {
 	ReportID         string
 	Exceeded         bool
 	FallbackAperture float64
-	CommandID        string
-	Token            string
+}
+
+// BackwaterResult is the single outcome of one backwater round. CommandID is
+// the stable fallback identity even while the round is still queued; Command
+// is populated only once the fallback movement has materialized.
+type BackwaterResult struct {
+	State     string
+	CommandID string
+	Command   domain.GateCommand
+	Gate      domain.Gate
 }
