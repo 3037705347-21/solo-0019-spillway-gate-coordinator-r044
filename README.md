@@ -82,6 +82,7 @@ go run ./cmd/workflowcheck --workflow register-gate
 go run ./cmd/workflowcheck --workflow request-gate-command
 go run ./cmd/workflowcheck --workflow review-safety-interlock
 go run ./cmd/workflowcheck --workflow execute-gate-command
+go run ./cmd/workflowcheck --workflow backwater-fallback
 ```
 
 这些检查会创建临时 HTTP 服务并调用真实路由。它们不调用外部网络，也不依赖数据库。

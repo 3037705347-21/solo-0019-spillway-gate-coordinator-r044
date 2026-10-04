@@ -108,115 +108,120 @@ func (m *MemoryRepository) ReportBackwater(
 	_ context.Context,
 	action BackwaterAction,
 	now time.Time,
-) (string, domain.GateCommand, domain.Gate, error) {
+) (BackwaterOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	gate, exists := m.gates[action.GateID]
 	if !exists {
-		return "", domain.GateCommand{}, domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
+		return BackwaterOutcome{}, domain.NotFound("gate_not_found", "gate id was not found")
 	}
 	reportID := strings.TrimSpace(action.ReportID)
 	if reportID == "" {
-		return "", domain.GateCommand{}, domain.Gate{}, domain.Invalid("invalid_backwater_report", "report id is required")
+		return BackwaterOutcome{}, domain.Invalid("invalid_backwater_report", "report id is required")
 	}
 
 	key := backwaterKey(action.GateID, reportID)
-	record, exists := m.backwater[key]
-	if exists && record.State == backwaterQueued {
-		command := domain.GateCommand{}
-		if record.CommandID != "" {
-			command = cloneCommand(m.commands[record.CommandID])
-		}
-		return record.State, command, gate, nil
+	if record, exists := m.backwater[key]; exists {
+		// The round was already resolved: replay the recorded outcome so
+		// repeated reports never spawn conflicting fallback actions.
+		return m.replayBackwaterLocked(record, gate, action.Exceeded), nil
 	}
 
 	if !action.Exceeded {
-		if !exists {
-			record = backwaterRecord{
-				GateID:   action.GateID,
-				ReportID: reportID,
-			}
+		state := backwaterClear
+		if m.cancelQueuedBackwaterLocked(action.GateID) {
+			state = backwaterCanceled
 		}
-		if record.State == backwaterQueued {
-			return backwaterCanceled, domain.GateCommand{}, gate, nil
+		m.backwater[key] = backwaterRecord{
+			GateID:           action.GateID,
+			ReportID:         reportID,
+			State:            state,
+			FallbackAperture: action.FallbackAperture,
 		}
-		record.State = backwaterClear
-		record.FallbackAperture = action.FallbackAperture
-		m.backwater[key] = record
 		m.backwaterByGate[action.GateID] = key
-		return backwaterClear, domain.GateCommand{}, gate, nil
+		return BackwaterOutcome{State: state, Gate: gate}, nil
 	}
 
-	command, err := domain.NewGateCommand(
-		action.CommandID,
-		action.GateID,
-		action.FallbackAperture,
-		gate.Aperture,
-		gate.MaxAperture,
-		"downstream_backwater_fallback",
-		"backwater-controller",
-		now,
-	)
-	if err != nil {
-		return "", domain.GateCommand{}, domain.Gate{}, err
-	}
-	decision, err := domain.NewInterlockDecision(
-		"clear",
-		"backwater-controller",
-		"automatic downstream fallback",
-		now,
-	)
-	if err != nil {
-		return "", domain.GateCommand{}, domain.Gate{}, err
-	}
-	if err := command.Review(decision, action.Token, now); err != nil {
-		return "", domain.GateCommand{}, domain.Gate{}, err
+	if action.FallbackAperture < 0 || action.FallbackAperture > gate.MaxAperture {
+		return BackwaterOutcome{}, domain.Invalid("invalid_fallback_aperture", "fallback aperture is outside the gate limit")
 	}
 
-	nextGate := gate
-	if gate.Status == domain.GateIdle {
-		if err := command.BeginExecution(action.Token, "backwater-controller", now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		if err := nextGate.Reserve(command.ID, now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		if err := nextGate.StartMovement(command.ID, now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		if err := nextGate.Settle(command.TargetAperture, false, now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		if err := command.Complete(now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-	} else {
-		if err := command.BeginExecution(action.Token, "backwater-controller", now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-		nextGate.ActiveCommandID = command.ID
-		nextGate.Status = domain.GateMoving
-		nextGate.Aperture = command.TargetAperture
-		nextGate.UpdatedAt = now.UTC()
-		nextGate.Version++
-		if err := command.Complete(now); err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, err
-		}
-	}
-
-	m.commands[command.ID] = command
-	m.gates[action.GateID] = nextGate
-	record = backwaterRecord{
+	record := backwaterRecord{
 		GateID:           action.GateID,
 		ReportID:         reportID,
-		State:            backwaterCompleted,
-		CommandID:        command.ID,
+		CommandID:        action.CommandID,
+		Token:            action.Token,
 		FallbackAperture: action.FallbackAperture,
 	}
+
+	if gate.Status != domain.GateIdle {
+		// Another command owns the gate: queue the fallback instead of
+		// interrupting the in-flight command. The newest report supersedes
+		// any fallback still waiting on this gate.
+		m.cancelQueuedBackwaterLocked(action.GateID)
+		record.State = backwaterQueued
+		m.backwater[key] = record
+		m.backwaterByGate[action.GateID] = key
+		return BackwaterOutcome{State: backwaterQueued, CommandID: record.CommandID, Gate: gate}, nil
+	}
+
+	command, nextGate, err := m.runBackwaterFallbackLocked(record, now)
+	if err != nil {
+		return BackwaterOutcome{}, err
+	}
+	record.State = backwaterCompleted
+	record.Token = ""
 	m.backwater[key] = record
 	m.backwaterByGate[action.GateID] = key
-	return backwaterCompleted, cloneCommand(command), nextGate, nil
+	return BackwaterOutcome{
+		State:     backwaterCompleted,
+		CommandID: command.ID,
+		Command:   cloneCommand(command),
+		Gate:      nextGate,
+	}, nil
+}
+
+func (m *MemoryRepository) replayBackwaterLocked(
+	record backwaterRecord,
+	gate domain.Gate,
+	exceeded bool,
+) BackwaterOutcome {
+	if record.State == backwaterQueued && !exceeded {
+		// The exceedance cleared before the queued fallback ran: cancel it
+		// and persist the cancellation so it can never fire later.
+		record.State = backwaterCanceled
+		record.Token = ""
+		m.backwater[backwaterKey(record.GateID, record.ReportID)] = record
+		return BackwaterOutcome{State: backwaterCanceled, CommandID: record.CommandID, Gate: gate}
+	}
+
+	outcome := BackwaterOutcome{
+		State:     record.State,
+		CommandID: record.CommandID,
+		Gate:      gate,
+	}
+	if record.State == backwaterCompleted && record.CommandID != "" {
+		if command, exists := m.commands[record.CommandID]; exists {
+			outcome.Command = cloneCommand(command)
+		}
+	}
+	return outcome
+}
+
+func (m *MemoryRepository) cancelQueuedBackwaterLocked(gateID string) bool {
+	key, exists := m.backwaterByGate[gateID]
+	if !exists {
+		return false
+	}
+	record, exists := m.backwater[key]
+	if !exists || record.State != backwaterQueued {
+		return false
+	}
+	record.State = backwaterCanceled
+	record.Token = ""
+	m.backwater[key] = record
+	return true
 }
 
 func (m *MemoryRepository) ReviewCommand(
@@ -316,11 +321,37 @@ func (m *MemoryRepository) activateBackwaterLocked(gate domain.Gate, now time.Ti
 	if !exists {
 		return gate
 	}
-	record := m.backwater[key]
-	if record.State != backwaterQueued || record.CommandID == "" {
+	record, exists := m.backwater[key]
+	if !exists || record.State != backwaterQueued {
 		return gate
 	}
 
+	if record.FallbackAperture == gate.Aperture {
+		// The gate already sits at the fallback aperture: nothing to move.
+		record.State = backwaterCompleted
+		record.Token = ""
+		m.backwater[key] = record
+		return gate
+	}
+
+	_, nextGate, err := m.runBackwaterFallbackLocked(record, now)
+	if err != nil {
+		return gate
+	}
+	record.State = backwaterCompleted
+	record.Token = ""
+	m.backwater[key] = record
+	return nextGate
+}
+
+// runBackwaterFallbackLocked drives one automatic fallback command through
+// review, execution, and settlement on an idle gate, storing both the
+// command and the resulting gate atomically.
+func (m *MemoryRepository) runBackwaterFallbackLocked(
+	record backwaterRecord,
+	now time.Time,
+) (domain.GateCommand, domain.Gate, error) {
+	gate := m.gates[record.GateID]
 	command, err := domain.NewGateCommand(
 		record.CommandID,
 		gate.ID,
@@ -332,7 +363,7 @@ func (m *MemoryRepository) activateBackwaterLocked(gate domain.Gate, now time.Ti
 		now,
 	)
 	if err != nil {
-		return gate
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
 	decision, err := domain.NewInterlockDecision(
 		"clear",
@@ -341,35 +372,32 @@ func (m *MemoryRepository) activateBackwaterLocked(gate domain.Gate, now time.Ti
 		now,
 	)
 	if err != nil {
-		return gate
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
 	if err := command.Review(decision, record.Token, now); err != nil {
-		return gate
+		return domain.GateCommand{}, domain.Gate{}, err
+	}
+	if err := command.BeginExecution(record.Token, "backwater-controller", now); err != nil {
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
 
 	nextGate := gate
-	if err := command.BeginExecution(record.Token, "backwater-controller", now); err != nil {
-		return gate
-	}
 	if err := nextGate.Reserve(command.ID, now); err != nil {
-		return gate
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
 	if err := nextGate.StartMovement(command.ID, now); err != nil {
-		return gate
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
 	if err := nextGate.Settle(command.TargetAperture, false, now); err != nil {
-		return gate
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
 	if err := command.Complete(now); err != nil {
-		return gate
+		return domain.GateCommand{}, domain.Gate{}, err
 	}
 
 	m.commands[command.ID] = command
-	record.State = backwaterCompleted
-	record.CommandID = command.ID
-	m.backwater[key] = record
 	m.gates[gate.ID] = nextGate
-	return nextGate
+	return command, nextGate, nil
 }
 
 func cloneCommand(command domain.GateCommand) domain.GateCommand {

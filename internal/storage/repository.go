@@ -16,7 +16,7 @@ type Repository interface {
 		ctx context.Context,
 		action BackwaterAction,
 		now time.Time,
-	) (string, domain.GateCommand, domain.Gate, error)
+	) (BackwaterOutcome, error)
 	ReviewCommand(
 		ctx context.Context,
 		commandID string,
@@ -41,4 +41,14 @@ type BackwaterAction struct {
 	FallbackAperture float64
 	CommandID        string
 	Token            string
+}
+
+// BackwaterOutcome reports how one exceedance round was resolved. CommandID
+// identifies the automatic fallback action for the round as soon as one was
+// planned; Command carries the stored command entity once it exists.
+type BackwaterOutcome struct {
+	State     string
+	CommandID string
+	Command   domain.GateCommand
+	Gate      domain.Gate
 }

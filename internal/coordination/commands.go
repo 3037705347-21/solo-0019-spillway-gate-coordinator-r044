@@ -50,10 +50,10 @@ func (s *Service) ReportBackwater(
 	ctx context.Context,
 	gateID string,
 	request contracts.ReportBackwaterRequest,
-) (string, domain.GateCommand, domain.Gate, error) {
+) (storage.BackwaterOutcome, error) {
 	reportID := strings.TrimSpace(request.ReportID)
 	if reportID == "" {
-		return "", domain.GateCommand{}, domain.Gate{}, domain.Invalid(
+		return storage.BackwaterOutcome{}, domain.Invalid(
 			"invalid_backwater_report",
 			"report id is required",
 		)
@@ -68,14 +68,14 @@ func (s *Service) ReportBackwater(
 	if action.Exceeded {
 		commandID, err := s.newID("bw")
 		if err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, domain.Internal(
+			return storage.BackwaterOutcome{}, domain.Internal(
 				"backwater_command_id_generation_failed",
 				"automatic fallback command id could not be generated",
 			)
 		}
 		token, err := s.newToken()
 		if err != nil {
-			return "", domain.GateCommand{}, domain.Gate{}, domain.Internal(
+			return storage.BackwaterOutcome{}, domain.Internal(
 				"backwater_token_generation_failed",
 				"automatic fallback token could not be generated",
 			)
